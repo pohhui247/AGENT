@@ -1,4 +1,5 @@
 from agent_baselines import Agent
+from agent_baselines import Agent
 import networkx as nx
 
 class StudentAgent(Agent):
@@ -58,12 +59,16 @@ class StudentAgent(Agent):
     # ---------------- Helpers ----------------
 
     def _sanitize_orders(self, orders):
-        # Keep only non-empty strings with >=2 tokens (engine expects at least unit + loc)
+        # Keep only orders that are currently legal for any unit.
+        possible_all = self.game.get_all_possible_orders()
+        valid = set()
+        for ops in possible_all.values():
+            valid.update(ops)
         clean = []
         for o in orders:
             if isinstance(o, str):
                 s = o.strip()
-                if len(s.split()) >= 2:
+                if s in valid:
                     clean.append(s)
         return clean
 
@@ -176,15 +181,15 @@ class StudentAgent(Agent):
     # New: choose exact move strings (supports coast variants)
     def _choose_move_string(self, possible, typ, src, dst_node):
         """
-        Pick the exact move string from 'possible' matching a move from src to a specific node.
-        Prefer convoy-via form if available.
+        Pick the exact move string from 'possible' matching src -> dst_node.
+        Prefer direct move; use ' VIA' only if direct is unavailable.
         """
         tgt = f"{typ} {src} - {dst_node}"
         via = f"{tgt} VIA"
-        if via in possible:
-            return via
         if tgt in possible:
             return tgt
+        if via in possible:
+            return via
         return None
 
     def _choose_move_to_province(self, possible, typ, src, prov):
@@ -197,6 +202,25 @@ class StudentAgent(Agent):
             if mv:
                 return mv, v, mv.replace(' VIA', '')
         return None, None, None
+
+    def _gather_convoyers(self, core, exclude=None):
+        """
+        Find all of our fleets that can issue ' C <core>' this phase.
+        Returns list of (fleet_loc, convoy_order).
+        """
+        exclude = exclude or set()
+        convoyers = []
+        all_possible_orders = self.game.get_all_possible_orders()
+        for floc in sorted(self.game.get_orderable_locations(self.power_name)):
+            if floc in exclude:
+                continue
+            if self._get_unit_type(floc) != 'F':
+                continue
+            fposs = all_possible_orders.get(floc, [])
+            c_order = next((po for po in fposs if f" C {core}" in po), None)
+            if c_order:
+                convoyers.append((floc, c_order))
+        return convoyers
 
     # ---------------- Heuristic (optional, kept light) ----------------
 
@@ -229,12 +253,11 @@ class StudentAgent(Agent):
         except Exception:
             pass
 
-        # Deterministic inputs
         raw_all_possible = self.game.get_all_possible_orders()
         all_possible_orders = {loc: sorted(ops) for loc, ops in raw_all_possible.items()}
         orderable_locations = sorted(self.game.get_orderable_locations(self.power_name))
 
-        # Non-movement phases: pick best legal orders, but always from possible
+        # Non-movement phases unchanged
         if self.game.phase_type != 'M':
             out = []
             targets = self._centers_not_mine()
@@ -242,7 +265,6 @@ class StudentAgent(Agent):
                 possible = all_possible_orders.get(loc, [])
                 if not possible:
                     continue
-                # Prefer builds closest to a target
                 if any(o.endswith(' B') for o in possible) and targets:
                     best = possible[0]
                     best_d = float('inf')
@@ -258,7 +280,6 @@ class StudentAgent(Agent):
                                 best, best_d = b, d
                     out.append(best)
                 else:
-                    # For retreats/disbands/wavers: choose first deterministic option
                     out.append(possible[0])
             return self._sanitize_orders(out)
 
@@ -278,7 +299,24 @@ class StudentAgent(Agent):
         def core_move_str(typ, src, dst):
             return f"{typ} {src} - {dst}"
 
-        # Italy-specific quick setups to avoid stall:
+        # Fall: secure centers you sit on (don’t walk off unowned SCs)
+        cur_phase = self.game.get_current_phase() or ''
+        is_fall_move = isinstance(cur_phase, str) and cur_phase.startswith('F')
+        if is_fall_move:
+            my_centers = set(self.game.get_centers(self.power_name))
+            scs = set(self.game.map.scs)
+            for loc in orderable_locations:
+                if loc in reserved_units:
+                    continue
+                base = loc.split('/')[0]
+                if base in scs and base not in my_centers:
+                    poss = all_possible_orders.get(loc, [])
+                    hold = next((o for o in poss if o.endswith(' H')), None)
+                    if hold:
+                        orders[loc] = hold
+                        reserved_units.add(loc)
+
+        # Italy-specific quick setups (kept as-is)
         if self.power_name == 'ITALY':
             # If we can form a supported attack on MAR this turn, do it.
             # Attack from LYO if possible, supported by WES or TYS.
@@ -355,30 +393,36 @@ class StudentAgent(Agent):
             typ = self._get_unit_type(loc)
 
             empty_capture = None
-            supported_occ_capture = None  # only accept occupied captures if we can support
+            supported_occ_capture = None  # occupied captures require a supporter (and convoyers if VIA)
 
             for tgt in sorted(t for t in targets if t not in assigned_targets):
-                # skip if all variant nodes already reserved
                 tgt_nodes = [v for v in self._coast_variants(tgt)]
                 if all(v in reserved_dests for v in tgt_nodes):
                     continue
-                # Try to find a legal move into any variant node
-                mv = self._choose_move_to_province(possible, typ, loc, tgt)[0]
+                mv, dst_node, core = self._choose_move_to_province(possible, typ, loc, tgt)
                 if not mv:
                     continue
-                core = mv.replace(' VIA', '')
-                dst_node = core.split(' - ')[1].strip().upper()
-                # avoid swap-bounce
+
+                # If this is a convoyed move (VIA), only accept if we can assign convoyers now
+                if ' VIA' in mv:
+                    convoyers = self._gather_convoyers(core, exclude=reserved_units | {loc})
+                    if not convoyers:
+                        continue  # cannot execute this convoy now
+
+                # avoid swap-bounce and destination clashes
                 if core_move_str(typ, dst_node, loc) in move_cores or dst_node in reserved_dests:
                     continue
+
                 if not enemy_occupied_node(dst_node):
                     empty_capture = (tgt, mv, dst_node, core)
                     break
                 else:
-                    # require a supporter now to schedule this attack
+                    # occupied: always require at least one adjacent supporter this turn
                     s_loc, s_order = self._has_supporter(core, exclude=reserved_units | {loc})
-                    if s_order:
-                        supported_occ_capture = (tgt, mv, dst_node, core, s_loc, s_order)
+                    if not s_order:
+                        continue
+                    # if convoyed, we also require convoyers (checked above)
+                    supported_occ_capture = (tgt, mv, dst_node, core, s_loc, s_order)
 
             if empty_capture:
                 tgt, mv, dst_node, core = empty_capture
@@ -386,21 +430,33 @@ class StudentAgent(Agent):
                 reserved_units.add(loc)
                 reserved_dests.add(dst_node)
                 move_cores.add(core)
+                # If this is a convoy, assign convoyers and reserve those sea tiles
+                if ' VIA' in mv:
+                    for floc, c_order in self._gather_convoyers(core, exclude=reserved_units):
+                        orders[floc] = c_order
+                        reserved_units.add(floc)
+                        reserved_dests.add(floc)  # prevent friendly moves into convoy sea tiles
                 assigned_targets.add(tgt)
                 continue
 
             if supported_occ_capture:
                 tgt, mv, dst_node, core, s_loc, s_order = supported_occ_capture
-                # Assign attacker and supporter
                 orders[loc] = mv
                 reserved_units.add(loc)
                 reserved_dests.add(dst_node)
                 move_cores.add(core)
+                # assign supporter
                 orders[s_loc] = s_order
                 reserved_units.add(s_loc)
+                # If convoyed, also assign convoyers and reserve those sea tiles
+                if ' VIA' in mv:
+                    for floc, c_order in self._gather_convoyers(core, exclude=reserved_units):
+                        orders[floc] = c_order
+                        reserved_units.add(floc)
+                        reserved_dests.add(floc)  # prevent friendly moves into convoy sea tiles
                 assigned_targets.add(tgt)
 
-        # Step 1.5: opportunistic supports for already-chosen attacks (kept)
+        # Step 1.5: opportunistic supports for already-chosen attacks
         for sloc in orderable_locations:
             if sloc in reserved_units:
                 continue
@@ -429,7 +485,6 @@ class StudentAgent(Agent):
             if not graph:
                 continue
 
-            # Candidate targets by reachability
             reachable = [t for t in sorted(targets) if any(v in graph.nodes for v in self._coast_variants(t))]
 
             chosen = None
@@ -447,22 +502,24 @@ class StudentAgent(Agent):
                 step = self._next_step_towards(graph, loc, best_node_for_t)
                 if step and step not in reserved_dests:
                     core = core_move_str(typ, loc, step)
-                    # If this step is the final destination and it's enemy-occupied, only take it if support exists.
+                    # If step lands on an enemy-occupied node, require a supporter to avoid futile poke
                     if step == best_node_for_t and enemy_occupied_node(step):
                         s_loc, s_order = self._has_supporter(core, exclude=reserved_units | {loc})
                         if not s_order:
-                            step = None  # skip futile poke
+                            step = None
                     if step and core_move_str(typ, step, loc) not in move_cores:
                         mv = self._choose_move_string(possible, typ, loc, step)
-                        if mv:
+                        # Do not pick convoy here; prefer repositioning by non-VIA moves
+                        if mv and ' VIA' not in mv:
                             chosen = mv
 
-            # Fallback: prefer repositioning over futile pokes
+            # Fallback: reposition without futile 1v1 or unwanted VIA
             if not chosen:
-                # Try any move that doesn't collide or reverse-swap; avoid attacks into obviously defended nodes we cannot support
                 for o in possible:
                     if ' - ' not in o:
                         continue
+                    if ' VIA' in o:
+                        continue  # skip convoys in fallback
                     core = o.replace(' VIA', '')
                     try:
                         dst = core.split(' - ')[1].strip().upper()
@@ -473,11 +530,11 @@ class StudentAgent(Agent):
                     if enemy_occupied_node(dst):
                         s_loc, s_order = self._has_supporter(core, exclude=reserved_units | {loc})
                         if not s_order:
-                            continue  # skip futile attack
+                            continue
                     chosen = o
                     break
                 if not chosen:
-                    # last resort: take first legal
+                    # last resort: hold or first legal order
                     chosen = possible[0]
 
             if chosen:
