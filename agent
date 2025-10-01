@@ -1,0 +1,496 @@
+from agent_baselines import Agent
+import networkx as nx
+
+class StudentAgent(Agent):
+    '''
+    Deterministic agent:
+    - Coast-aware targeting for provinces (e.g., BUL/EC vs BUL/SC)
+    - Targets all non-owned SCs (neutral + enemy)
+    - Avoids self-bounces and swap-bounces
+    - Uses simple supports and simple convoys if legal orders exist
+    - Returns only valid orders from get_all_possible_orders()
+    '''
+
+    def __init__(self, agent_name='24128968'):
+        super().__init__(agent_name)
+        self.game = None
+        self.power_name = None
+        self.map_graph_army = None
+        self.map_graph_navy = None
+
+    def new_game(self, game, power_name):
+        self.game = game
+        self.power_name = power_name
+        # Build graphs once per Game instance
+        if not self.map_graph_army or not self.map_graph_navy:
+            self.build_map_graphs()
+
+    def update_game(self, all_power_orders):
+        # Do not change this contract with the engine.
+        for power_name in all_power_orders.keys():
+            self.game.set_orders(power_name, all_power_orders[power_name])
+        self.game.process()
+
+    def build_map_graphs(self):
+        if not self.game:
+            raise Exception('Game Not Initialised. Cannot Build Map Graphs.')
+
+        self.map_graph_army = nx.Graph()
+        self.map_graph_navy = nx.Graph()
+
+        locations = list(self.game.map.loc_type.keys())  # includes coast nodes like BUL/EC
+        for loc in locations:
+            lt = self.game.map.loc_type[loc]
+            if lt in ('LAND', 'COAST'):
+                self.map_graph_army.add_node(loc)
+            if lt in ('WATER', 'COAST'):
+                self.map_graph_navy.add_node(loc)
+
+        # Deterministic ordering for edges
+        sorted_locs = sorted(locations)
+        for i in sorted_locs:
+            for j in sorted_locs:
+                if self.game.map.abuts('A', i, '-', j):
+                    self.map_graph_army.add_edge(i, j)
+                if self.game.map.abuts('F', i, '-', j):
+                    self.map_graph_navy.add_edge(i, j)
+
+    # ---------------- Helpers ----------------
+
+    def _sanitize_orders(self, orders):
+        # Keep only non-empty strings with >=2 tokens (engine expects at least unit + loc)
+        clean = []
+        for o in orders:
+            if isinstance(o, str):
+                s = o.strip()
+                if len(s.split()) >= 2:
+                    clean.append(s)
+        return clean
+
+    def _get_unit_type(self, loc):
+        """Return 'A' or 'F' for the unit at loc, else None."""
+        u_loc = (loc or '').upper()
+        # Powers store units as strings like "A PAR", "F ENG"
+        for power in self.game.powers.values():
+            for unit in getattr(power, 'units', []):
+                if isinstance(unit, str) and len(unit) >= 3:
+                    unit_type = unit[0]
+                    unit_loc = unit[2:].upper()
+                    if unit_loc == u_loc:
+                        return unit_type
+        # Fallback via possible order prefixes at that loc
+        poss = self.game.get_all_possible_orders().get(u_loc, [])
+        if any(isinstance(o, str) and o.startswith('A ') for o in poss):
+            return 'A'
+        if any(isinstance(o, str) and o.startswith('F ') for o in poss):
+            return 'F'
+        return None
+
+    def _coast_variants(self, prov):
+        """
+        Return node variants for a province: e.g., BUL -> ['BUL', 'BUL/EC', 'BUL/SC'] if they exist.
+        """
+        prov = (prov or '').upper()
+        variants = []
+        if prov in self.game.map.loc_type:
+            variants.append(prov)
+        for suf in ('/NC', '/SC', '/EC', '/WC'):
+            key = prov + suf
+            if key in self.game.map.loc_type:
+                variants.append(key)
+        return variants or [prov]
+
+    def _graph_for_type(self, unit_type):
+        return self.map_graph_navy if unit_type == 'F' else self.map_graph_army
+
+    def _shortest_paths(self, graph, src):
+        try:
+            return nx.shortest_path(graph, source=(src or '').upper())
+        except Exception:
+            return {}
+
+    def _next_step_towards(self, graph, src, dst):
+        if not src or not dst:
+            return None
+        try:
+            path = nx.shortest_path(graph, source=src, target=dst)
+            if len(path) >= 2:
+                return path[1]
+        except Exception:
+            return None
+        return None
+
+    def _distance_node(self, graph, src, dst_node):
+        if not src or not dst_node:
+            return float('inf')
+        try:
+            path = nx.shortest_path(graph, source=src, target=dst_node)
+            return max(0, len(path) - 1)
+        except Exception:
+            return float('inf')
+
+    def _distance_to_province(self, unit_type, src, prov):
+        """Min distance from src to any node variant of prov for the given unit type."""
+        graph = self._graph_for_type(unit_type)
+        if not graph:
+            return float('inf'), None
+        best_d = float('inf')
+        best_node = None
+        for node in sorted(self._coast_variants(prov)):
+            if node in graph.nodes:
+                d = self._distance_node(graph, src, node)
+                if d < best_d:
+                    best_d = d
+                    best_node = node
+        return best_d, best_node
+
+    def _centers_not_mine(self):
+        all_centers = set(self.game.map.scs)
+        my_centers = set(self.game.get_centers(self.power_name))
+        return sorted(all_centers - my_centers)
+
+    def _occupied_map(self):
+        """Map node -> (owner, unit_type)."""
+        occ = {}
+        for pname, power in self.game.powers.items():
+            for unit in getattr(power, 'units', []):
+                if isinstance(unit, str) and len(unit) >= 3:
+                    utype = unit[0]
+                    uloc = unit[2:].upper()
+                    occ[uloc] = (pname, utype)
+        return occ
+
+    def _has_supporter(self, support_core, exclude=None):
+        """Return (sloc, s_order) if any of our units can issue ' S <support_core>' now."""
+        exclude = exclude or set()
+        all_possible_orders = self.game.get_all_possible_orders()
+        for sloc in sorted(self.game.get_orderable_locations(self.power_name)):
+            if sloc in exclude:
+                continue
+            sposs = all_possible_orders.get(sloc, [])
+            s_order = next((so for so in sposs if f" S {support_core}" in so), None)
+            if s_order:
+                return sloc, s_order
+        return None, None
+
+    # New: choose exact move strings (supports coast variants)
+    def _choose_move_string(self, possible, typ, src, dst_node):
+        """
+        Pick the exact move string from 'possible' matching a move from src to a specific node.
+        Prefer convoy-via form if available.
+        """
+        tgt = f"{typ} {src} - {dst_node}"
+        via = f"{tgt} VIA"
+        if via in possible:
+            return via
+        if tgt in possible:
+            return tgt
+        return None
+
+    def _choose_move_to_province(self, possible, typ, src, prov):
+        """
+        Find a legal move from src into any coast-variant node of prov.
+        Returns (move_string, dst_node, core_without_via) or (None, None, None).
+        """
+        for v in sorted(self._coast_variants(prov)):
+            mv = self._choose_move_string(possible, typ, src, v)
+            if mv:
+                return mv, v, mv.replace(' VIA', '')
+        return None, None, None
+
+    # ---------------- Heuristic (optional, kept light) ----------------
+
+    def heuristic(self):
+        if not self.game:
+            return 0.0
+        score = 100.0 * len(self.game.get_centers(self.power_name))
+        try:
+            if not self.map_graph_army or not self.map_graph_navy:
+                self.build_map_graphs()
+        except Exception:
+            pass
+        # Mobility bonus
+        orderable = sorted(self.game.get_orderable_locations(self.power_name))
+        targets = self._centers_not_mine()
+        for loc in orderable:
+            unit_type = self._get_unit_type(loc)
+            d, _ = self._distance_to_province(unit_type, loc, targets[0] if targets else None)
+            if d < float('inf'):
+                score += max(0, 10 - d)
+        return score
+
+    # ---------------- Core policy ----------------
+
+    def get_actions(self):
+        # Ensure graphs exist
+        try:
+            if not self.map_graph_army or not self.map_graph_navy:
+                self.build_map_graphs()
+        except Exception:
+            pass
+
+        # Deterministic inputs
+        raw_all_possible = self.game.get_all_possible_orders()
+        all_possible_orders = {loc: sorted(ops) for loc, ops in raw_all_possible.items()}
+        orderable_locations = sorted(self.game.get_orderable_locations(self.power_name))
+
+        # Non-movement phases: pick best legal orders, but always from possible
+        if self.game.phase_type != 'M':
+            out = []
+            targets = self._centers_not_mine()
+            for loc in orderable_locations:
+                possible = all_possible_orders.get(loc, [])
+                if not possible:
+                    continue
+                # Prefer builds closest to a target
+                if any(o.endswith(' B') for o in possible) and targets:
+                    best = possible[0]
+                    best_d = float('inf')
+                    for b in possible:
+                        if not b.endswith(' B'):
+                            continue
+                        parts = b.split()
+                        if len(parts) >= 3:
+                            unit_letter = parts[0]
+                            site = parts[1].upper()
+                            d, _ = self._distance_to_province(unit_letter, site, targets[0])
+                            if d < best_d:
+                                best, best_d = b, d
+                    out.append(best)
+                else:
+                    # For retreats/disbands/wavers: choose first deterministic option
+                    out.append(possible[0])
+            return self._sanitize_orders(out)
+
+        # Movement phase
+        orders = {}
+        reserved_units = set()
+        reserved_dests = set()
+        move_cores = set()
+
+        occupied = self._occupied_map()
+        targets = set(self._centers_not_mine())
+
+        def enemy_occupied_node(node):
+            node = (node or '').upper()
+            return node in occupied and occupied[node][0] != self.power_name
+
+        def core_move_str(typ, src, dst):
+            return f"{typ} {src} - {dst}"
+
+        # Italy-specific quick setups to avoid stall:
+        if self.power_name == 'ITALY':
+            # If we can form a supported attack on MAR this turn, do it.
+            # Attack from LYO if possible, supported by WES or TYS.
+            lyoloc = 'LYO'
+            marprov = 'MAR'
+            ly_att = None
+            sup_pair = None
+            # Find if we have a unit in LYO that can move to MAR
+            if lyoloc in orderable_locations:
+                typ = self._get_unit_type(lyoloc)
+                poss = all_possible_orders.get(lyoloc, [])
+                mv = self._choose_move_to_province(poss, typ, lyoloc, marprov)[0]
+                if mv:
+                    core = mv.replace(' VIA', '')
+                    # Check supporter from WES or TYS if orderable
+                    for sup_loc in ('WES', 'TYS'):
+                        if sup_loc in orderable_locations and sup_loc not in reserved_units:
+                            sposs = all_possible_orders.get(sup_loc, [])
+                            s_order = next((so for so in sposs if f" S {core}" in so), None)
+                            if s_order:
+                                ly_att = (lyoloc, mv, core)
+                                sup_pair = (sup_loc, s_order)
+                                break
+            if ly_att and sup_pair:
+                loc, mv, core = ly_att
+                orders[loc] = mv
+                reserved_units.add(loc)
+                try:
+                    dst = core.split(' - ')[1].strip().upper()
+                    reserved_dests.add(dst)
+                except Exception:
+                    pass
+                move_cores.add(core)
+                s_loc, s_order = sup_pair
+                orders[s_loc] = s_order
+                reserved_units.add(s_loc)
+
+            # If A VEN exists and no supporter for VEN->TRI is available, move a nearby fleet to ADR to create it.
+            if 'VEN' in orderable_locations and 'A' == self._get_unit_type('VEN'):
+                # Would VEN->TRI have a supporter now?
+                vposs = all_possible_orders.get('VEN', [])
+                v_mv = self._choose_move_to_province(vposs, 'A', 'VEN', 'TRI')[0]
+                need_adr = True
+                if v_mv:
+                    core = v_mv.replace(' VIA', '')
+                    s_loc, s_order = self._has_supporter(core, exclude=reserved_units | {'VEN'})
+                    if s_order:
+                        need_adr = False
+                if need_adr and 'ADR' in orderable_locations and 'ADR' not in reserved_units:
+                    ftyp = self._get_unit_type('ADR')
+                    # If ADR already ours, keep it for future support; else try to move someone into ADR
+                    pass
+                else:
+                    # Try to move a fleet adjacent to ADR into ADR (ION preferred)
+                    for src in ('ION', 'ALB', 'APU'):
+                        if src in orderable_locations and src not in reserved_units and self._get_unit_type(src) == 'F':
+                            sposs = all_possible_orders.get(src, [])
+                            mv = self._choose_move_string(sposs, 'F', src, 'ADR')
+                            if mv:
+                                orders[src] = mv
+                                reserved_units.add(src)
+                                reserved_dests.add('ADR')
+                                move_cores.add(core_move_str('F', src, 'ADR'))
+                                break
+
+        # Step 1: direct captures into target SCs (reserve destinations)
+        assigned_targets = set()
+        for loc in orderable_locations:
+            if loc in reserved_units:
+                continue
+            possible = all_possible_orders.get(loc, [])
+            if not possible:
+                continue
+            typ = self._get_unit_type(loc)
+
+            empty_capture = None
+            supported_occ_capture = None  # only accept occupied captures if we can support
+
+            for tgt in sorted(t for t in targets if t not in assigned_targets):
+                # skip if all variant nodes already reserved
+                tgt_nodes = [v for v in self._coast_variants(tgt)]
+                if all(v in reserved_dests for v in tgt_nodes):
+                    continue
+                # Try to find a legal move into any variant node
+                mv = self._choose_move_to_province(possible, typ, loc, tgt)[0]
+                if not mv:
+                    continue
+                core = mv.replace(' VIA', '')
+                dst_node = core.split(' - ')[1].strip().upper()
+                # avoid swap-bounce
+                if core_move_str(typ, dst_node, loc) in move_cores or dst_node in reserved_dests:
+                    continue
+                if not enemy_occupied_node(dst_node):
+                    empty_capture = (tgt, mv, dst_node, core)
+                    break
+                else:
+                    # require a supporter now to schedule this attack
+                    s_loc, s_order = self._has_supporter(core, exclude=reserved_units | {loc})
+                    if s_order:
+                        supported_occ_capture = (tgt, mv, dst_node, core, s_loc, s_order)
+
+            if empty_capture:
+                tgt, mv, dst_node, core = empty_capture
+                orders[loc] = mv
+                reserved_units.add(loc)
+                reserved_dests.add(dst_node)
+                move_cores.add(core)
+                assigned_targets.add(tgt)
+                continue
+
+            if supported_occ_capture:
+                tgt, mv, dst_node, core, s_loc, s_order = supported_occ_capture
+                # Assign attacker and supporter
+                orders[loc] = mv
+                reserved_units.add(loc)
+                reserved_dests.add(dst_node)
+                move_cores.add(core)
+                orders[s_loc] = s_order
+                reserved_units.add(s_loc)
+                assigned_targets.add(tgt)
+
+        # Step 1.5: opportunistic supports for already-chosen attacks (kept)
+        for sloc in orderable_locations:
+            if sloc in reserved_units:
+                continue
+            sposs = all_possible_orders.get(sloc, [])
+            if not sposs:
+                continue
+            for atk_order in sorted(orders.values()):
+                if ' - ' not in atk_order:
+                    continue
+                support_core = atk_order.replace(' VIA', '')
+                s_order = next((so for so in sposs if f" S {support_core}" in so), None)
+                if s_order:
+                    orders[sloc] = s_order
+                    reserved_units.add(sloc)
+                    break
+
+        # Step 2: advance toward nearest target SCs (avoid futile 1v1 pokes)
+        for loc in orderable_locations:
+            if loc in reserved_units:
+                continue
+            possible = all_possible_orders.get(loc, [])
+            if not possible:
+                continue
+            typ = self._get_unit_type(loc)
+            graph = self._graph_for_type(typ)
+            if not graph:
+                continue
+
+            # Candidate targets by reachability
+            reachable = [t for t in sorted(targets) if any(v in graph.nodes for v in self._coast_variants(t))]
+
+            chosen = None
+            best_node_for_t = None
+            best_t = None
+            best_d = float('inf')
+            for t in reachable:
+                d, node = self._distance_to_province(typ, loc, t)
+                if node is None:
+                    continue
+                if d < best_d:
+                    best_t, best_d, best_node_for_t = t, d, node
+
+            if best_t is not None and best_d < float('inf'):
+                step = self._next_step_towards(graph, loc, best_node_for_t)
+                if step and step not in reserved_dests:
+                    core = core_move_str(typ, loc, step)
+                    # If this step is the final destination and it's enemy-occupied, only take it if support exists.
+                    if step == best_node_for_t and enemy_occupied_node(step):
+                        s_loc, s_order = self._has_supporter(core, exclude=reserved_units | {loc})
+                        if not s_order:
+                            step = None  # skip futile poke
+                    if step and core_move_str(typ, step, loc) not in move_cores:
+                        mv = self._choose_move_string(possible, typ, loc, step)
+                        if mv:
+                            chosen = mv
+
+            # Fallback: prefer repositioning over futile pokes
+            if not chosen:
+                # Try any move that doesn't collide or reverse-swap; avoid attacks into obviously defended nodes we cannot support
+                for o in possible:
+                    if ' - ' not in o:
+                        continue
+                    core = o.replace(' VIA', '')
+                    try:
+                        dst = core.split(' - ')[1].strip().upper()
+                    except Exception:
+                        continue
+                    if dst in reserved_dests or core_move_str(typ, dst, loc) in move_cores:
+                        continue
+                    if enemy_occupied_node(dst):
+                        s_loc, s_order = self._has_supporter(core, exclude=reserved_units | {loc})
+                        if not s_order:
+                            continue  # skip futile attack
+                    chosen = o
+                    break
+                if not chosen:
+                    # last resort: take first legal
+                    chosen = possible[0]
+
+            if chosen:
+                orders[loc] = chosen
+                reserved_units.add(loc)
+                if ' - ' in chosen:
+                    try:
+                        dst = chosen.replace(' VIA', '').split(' - ')[1].strip().upper()
+                    except Exception:
+                        dst = None
+                    if dst:
+                        reserved_dests.add(dst)
+                        move_cores.add(core_move_str(self._get_unit_type(loc), loc, dst))
+
+        final = [orders[l] for l in sorted(orders.keys()) if orders.get(l)]
+        return self._sanitize_orders(final)
