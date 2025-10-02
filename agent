@@ -1,5 +1,4 @@
 from agent_baselines import Agent
-from agent_baselines import Agent
 import networkx as nx
 
 class StudentAgent(Agent):
@@ -222,6 +221,41 @@ class StudentAgent(Agent):
                 convoyers.append((floc, c_order))
         return convoyers
 
+    # --- Ownership and pressure helpers ---
+    def _owner_of_province(self, prov):
+        """
+        Return the owner of a base province (SC) or None if neutral/not an SC.
+        """
+        base = (prov or '').split('/')[0].upper()
+        sc_bases = {s.split('/')[0].upper() for s in self.game.map.scs}
+        if base not in sc_bases:
+            return None
+        for pname in self.game.powers.keys():
+            try:
+                centers = {c.split('/')[0].upper() for c in self.game.get_centers(pname)}
+            except Exception:
+                centers = set()
+            if base in centers:
+                return pname
+        return None
+
+    def _enemy_pressure(self):
+        """
+        Approximate enemy pressure: count how many enemy units could move
+        into each adjacent node (graph-neighbor based; fast and engine-agnostic).
+        """
+        press = {}
+        occ = self._occupied_map()
+        for node, (owner, utype) in occ.items():
+            if owner == self.power_name:
+                continue
+            graph = self._graph_for_type(utype)
+            if not graph or node not in graph:
+                continue
+            for nbr in graph.neighbors(node):
+                press[nbr] = press.get(nbr, 0) + 1
+        return press
+
     # ---------------- Heuristic (optional, kept light) ----------------
 
     def heuristic(self):
@@ -291,10 +325,30 @@ class StudentAgent(Agent):
 
         occupied = self._occupied_map()
         targets = set(self._centers_not_mine())
+        enemy_press = self._enemy_pressure()
 
         def enemy_occupied_node(node):
             node = (node or '').upper()
             return node in occupied and occupied[node][0] != self.power_name
+
+        def my_occupied_node(node):
+            node = (node or '').upper()
+            return node in occupied and occupied[node][0] == self.power_name
+
+        def improves_distance(unit_type, src_node, dst_node):
+            # True if this step reduces distance to any target SC
+            if not targets or not src_node or not dst_node:
+                return True
+            best_src = float('inf')
+            best_dst = float('inf')
+            for t in targets:
+                d_src, _ = self._distance_to_province(unit_type, src_node, t)
+                d_dst, _ = self._distance_to_province(unit_type, dst_node, t)
+                if d_src < best_src:
+                    best_src = d_src
+                if d_dst < best_dst:
+                    best_dst = d_dst
+            return best_dst < best_src
 
         def core_move_str(typ, src, dst):
             return f"{typ} {src} - {dst}"
@@ -316,72 +370,6 @@ class StudentAgent(Agent):
                         orders[loc] = hold
                         reserved_units.add(loc)
 
-        # Italy-specific quick setups (kept as-is)
-        if self.power_name == 'ITALY':
-            # If we can form a supported attack on MAR this turn, do it.
-            # Attack from LYO if possible, supported by WES or TYS.
-            lyoloc = 'LYO'
-            marprov = 'MAR'
-            ly_att = None
-            sup_pair = None
-            # Find if we have a unit in LYO that can move to MAR
-            if lyoloc in orderable_locations:
-                typ = self._get_unit_type(lyoloc)
-                poss = all_possible_orders.get(lyoloc, [])
-                mv = self._choose_move_to_province(poss, typ, lyoloc, marprov)[0]
-                if mv:
-                    core = mv.replace(' VIA', '')
-                    # Check supporter from WES or TYS if orderable
-                    for sup_loc in ('WES', 'TYS'):
-                        if sup_loc in orderable_locations and sup_loc not in reserved_units:
-                            sposs = all_possible_orders.get(sup_loc, [])
-                            s_order = next((so for so in sposs if f" S {core}" in so), None)
-                            if s_order:
-                                ly_att = (lyoloc, mv, core)
-                                sup_pair = (sup_loc, s_order)
-                                break
-            if ly_att and sup_pair:
-                loc, mv, core = ly_att
-                orders[loc] = mv
-                reserved_units.add(loc)
-                try:
-                    dst = core.split(' - ')[1].strip().upper()
-                    reserved_dests.add(dst)
-                except Exception:
-                    pass
-                move_cores.add(core)
-                s_loc, s_order = sup_pair
-                orders[s_loc] = s_order
-                reserved_units.add(s_loc)
-
-            # If A VEN exists and no supporter for VEN->TRI is available, move a nearby fleet to ADR to create it.
-            if 'VEN' in orderable_locations and 'A' == self._get_unit_type('VEN'):
-                # Would VEN->TRI have a supporter now?
-                vposs = all_possible_orders.get('VEN', [])
-                v_mv = self._choose_move_to_province(vposs, 'A', 'VEN', 'TRI')[0]
-                need_adr = True
-                if v_mv:
-                    core = v_mv.replace(' VIA', '')
-                    s_loc, s_order = self._has_supporter(core, exclude=reserved_units | {'VEN'})
-                    if s_order:
-                        need_adr = False
-                if need_adr and 'ADR' in orderable_locations and 'ADR' not in reserved_units:
-                    ftyp = self._get_unit_type('ADR')
-                    # If ADR already ours, keep it for future support; else try to move someone into ADR
-                    pass
-                else:
-                    # Try to move a fleet adjacent to ADR into ADR (ION preferred)
-                    for src in ('ION', 'ALB', 'APU'):
-                        if src in orderable_locations and src not in reserved_units and self._get_unit_type(src) == 'F':
-                            sposs = all_possible_orders.get(src, [])
-                            mv = self._choose_move_string(sposs, 'F', src, 'ADR')
-                            if mv:
-                                orders[src] = mv
-                                reserved_units.add(src)
-                                reserved_dests.add('ADR')
-                                move_cores.add(core_move_str('F', src, 'ADR'))
-                                break
-
         # Step 1: direct captures into target SCs (reserve destinations)
         assigned_targets = set()
         for loc in orderable_locations:
@@ -392,7 +380,7 @@ class StudentAgent(Agent):
                 continue
             typ = self._get_unit_type(loc)
 
-            empty_capture = None
+            empty_capture = None  # may include optional supporter (s_loc, s_order)
             supported_occ_capture = None  # occupied captures require a supporter (and convoyers if VIA)
 
             for tgt in sorted(t for t in targets if t not in assigned_targets):
@@ -402,6 +390,12 @@ class StudentAgent(Agent):
                 mv, dst_node, core = self._choose_move_to_province(possible, typ, loc, tgt)
                 if not mv:
                     continue
+
+                # Avoid moving into a tile we currently occupy unless it’s already moving out
+                if my_occupied_node(dst_node):
+                    existing = orders.get(dst_node)
+                    if not (isinstance(existing, str) and ' - ' in existing):
+                        continue
 
                 # If this is a convoyed move (VIA), only accept if we can assign convoyers now
                 if ' VIA' in mv:
@@ -414,7 +408,15 @@ class StudentAgent(Agent):
                     continue
 
                 if not enemy_occupied_node(dst_node):
-                    empty_capture = (tgt, mv, dst_node, core)
+                    # Gate contested neutrals: if neutral and enemies can also enter, require support
+                    owner = self._owner_of_province(tgt)
+                    if owner is None and enemy_press.get(dst_node, 0) > 0:
+                        s_loc, s_order = self._has_supporter(core, exclude=reserved_units | {loc})
+                        if not s_order:
+                            continue
+                        empty_capture = (tgt, mv, dst_node, core, s_loc, s_order)
+                    else:
+                        empty_capture = (tgt, mv, dst_node, core, None, None)
                     break
                 else:
                     # occupied: always require at least one adjacent supporter this turn
@@ -425,11 +427,14 @@ class StudentAgent(Agent):
                     supported_occ_capture = (tgt, mv, dst_node, core, s_loc, s_order)
 
             if empty_capture:
-                tgt, mv, dst_node, core = empty_capture
+                tgt, mv, dst_node, core, s_loc, s_order = empty_capture
                 orders[loc] = mv
                 reserved_units.add(loc)
                 reserved_dests.add(dst_node)
                 move_cores.add(core)
+                if s_order:
+                    orders[s_loc] = s_order
+                    reserved_units.add(s_loc)
                 # If this is a convoy, assign convoyers and reserve those sea tiles
                 if ' VIA' in mv:
                     for floc, c_order in self._gather_convoyers(core, exclude=reserved_units):
@@ -501,17 +506,36 @@ class StudentAgent(Agent):
             if best_t is not None and best_d < float('inf'):
                 step = self._next_step_towards(graph, loc, best_node_for_t)
                 if step and step not in reserved_dests:
-                    core = core_move_str(typ, loc, step)
-                    # If step lands on an enemy-occupied node, require a supporter to avoid futile poke
-                    if step == best_node_for_t and enemy_occupied_node(step):
-                        s_loc, s_order = self._has_supporter(core, exclude=reserved_units | {loc})
-                        if not s_order:
+                    # Avoid moving into our own tile unless it’s already moving out
+                    if my_occupied_node(step):
+                        existing = orders.get(step)
+                        if not (isinstance(existing, str) and ' - ' in existing):
                             step = None
-                    if step and core_move_str(typ, step, loc) not in move_cores:
-                        mv = self._choose_move_string(possible, typ, loc, step)
-                        # Do not pick convoy here; prefer repositioning by non-VIA moves
-                        if mv and ' VIA' not in mv:
-                            chosen = mv
+                    if step:
+                        core = core_move_str(typ, loc, step)
+                        # Require support for any enemy-occupied step (not just final target node)
+                        if enemy_occupied_node(step):
+                            s_loc, s_order = self._has_supporter(core, exclude=reserved_units | {loc})
+                            if not s_order:
+                                step = None
+                        # Gate contested neutrals at final step if enemies can also enter
+                        if step and step == best_node_for_t:
+                            owner = self._owner_of_province(best_t)
+                            if owner is None and enemy_press.get(step, 0) > 0:
+                                s_loc2, s_order2 = self._has_supporter(core, exclude=reserved_units | {loc})
+                                if not s_order2:
+                                    step = None
+                                else:
+                                    orders[s_loc2] = s_order2
+                                    reserved_units.add(s_loc2)
+                        # Require progress for non-final advance to avoid oscillation
+                        if step and step != best_node_for_t and not improves_distance(typ, loc, step):
+                            step = None
+                        if step and core_move_str(typ, step, loc) not in move_cores:
+                            mv = self._choose_move_string(possible, typ, loc, step)
+                            # Do not pick convoy here; prefer repositioning by non-VIA moves
+                            if mv and ' VIA' not in mv:
+                                chosen = mv
 
             # Fallback: reposition without futile 1v1 or unwanted VIA
             if not chosen:
@@ -527,10 +551,15 @@ class StudentAgent(Agent):
                         continue
                     if dst in reserved_dests or core_move_str(typ, dst, loc) in move_cores:
                         continue
+                    if my_occupied_node(dst):
+                        continue
                     if enemy_occupied_node(dst):
                         s_loc, s_order = self._has_supporter(core, exclude=reserved_units | {loc})
                         if not s_order:
                             continue
+                    # Only take fallback if it reduces distance to some target
+                    if not improves_distance(typ, loc, dst):
+                        continue
                     chosen = o
                     break
                 if not chosen:
